@@ -1,5 +1,6 @@
 import sys
 import os
+import time
 import querier
 import collections
 
@@ -17,9 +18,24 @@ class WdCatTool(object):
         self.target_map = {}
         self.pages_in_cat = {}
         self.cat_for_pages = collections.defaultdict(dict)
-        
+        self.queries = []
+
         self.q = querier.Querier(host='c3.labsdb', mediawiki=True, verbose=verbose)
-        
+    
+    def query(self, sql, sqlargs, **kwargs):
+        st = time.time()
+        retval = self.q.do(sql, sqlargs, **kwargs)
+        et = time.time()
+        self.queries.append({
+            'sql': sql,
+            'sqlargs': sqlargs,
+            'kwargs': kwargs,
+            'start_time': st,
+            'run_time': et-st,
+            'n_results': len(retval)
+        })
+        return retval
+    
     def prepare(self):
         self.sourcecat = self.get_cat(self.baseQ, self.sourcewiki)
         self.targetcat = self.get_cat(self.baseQ, self.targetwiki)
@@ -40,11 +56,11 @@ class WdCatTool(object):
         
     @property
     def sourcesite(self):
-        return pywikibot.site.APISite.fromDBName(sourcewiki)
+        return pywikibot.site.APISite.fromDBName(self.sourcewiki)
 
     @property
     def targetsite(self):
-        return pywikibot.site.APISite.fromDBName(targetwiki)
+        return pywikibot.site.APISite.fromDBName(self.targetwiki)
 
     def get_cat(self, item_id, site_id):
         return self.get_wdq_item(pywikibot.Category, item_id, site_id)
@@ -65,7 +81,7 @@ class WdCatTool(object):
             pass
 
         try:
-            catname = q.do(sql, (item_id, site_id))[0]['ips_site_page']
+            catname = self.query(sql, (item_id, site_id))[0]['ips_site_page']
             site = pywikibot.site.APISite.fromDBName(site_id)
             item = typ(site, catname)
         except IndexError:
@@ -85,7 +101,7 @@ class WdCatTool(object):
         WHERE page_namespace=14
         AND cl_to=%s
         """.format(dbname=cat.site.dbName() + "_p")
-        subcats = q.do(sql, [cat.title(underscore=True, withNamespace=False,)])
+        subcats = self.query(sql, [cat.title(underscore=True, withNamespace=False,)])
         subcats = [x["page_title"] for x in subcats]
         subcats = [pywikibot.Category(cat.site, x) for x in subcats]
         return subcats
@@ -103,7 +119,7 @@ class WdCatTool(object):
     def flatten(self, tree):
         out = tree.keys()
         for subtree in tree.values():
-            out = out + flatten(subtree)
+            out = out + self.flatten(subtree)
         return out
 
     def get_wdq(self, cat):
@@ -116,7 +132,7 @@ class WdCatTool(object):
         if cat in self.pagemap:
             return self.pagemap[cat]
         try:
-            Q = q.do(sql, (cat.site.dbName(), cat.title()))[0]['ips_item_id']
+            Q = self.query(sql, (cat.site.dbName(), cat.title()))[0]['ips_item_id']
         except IndexError:
             Q = None
         
@@ -153,7 +169,7 @@ class WdCatTool(object):
         WHERE page_namespace=0
         AND cl_to=%s
         """.format(dbname=cat.site.dbName() + "_p")
-        pages = q.do(sql, [cat.title(underscore=True, withNamespace=False,)])
+        pages = self.query(sql, [cat.title(underscore=True, withNamespace=False,)])
         pages = [x["page_title"] for x in pages]
         pages = [pywikibot.Page(cat.site, x) for x in pages]
         
@@ -165,7 +181,7 @@ class WdCatTool(object):
 
     # now print the tree for source, and show target categories
     def print_tree_and_pages_recursive(self, tree, depth=0):
-        titlekwargs = dict(asLink=True, textlink=True, insite=targetsite)
+        titlekwargs = dict(asLink=True, textlink=True, insite=self.targetsite)
         for scat,v in tree.iteritems():
             tcat = self.target_map[scat]
             print u"{:<60}: {}".format("*"*(depth+1) + "'''" + scat.title(**titlekwargs), tcat.title(**titlekwargs) + "'''")
@@ -175,14 +191,47 @@ class WdCatTool(object):
             
             for s,t in pages:
                 if t is not None:
-                    # check if t is already categorized correctly
-                    if self.cat_for_pages[t] == tcat:
-                        pass
                     print "*"*(depth+2) + u"{:<50}: {:<50}".format(s.title(**titlekwargs), t.title(**titlekwargs))
             self.print_tree_and_pages_recursive(v, depth=depth+1)
     
     def print_tree(self):
         self.print_tree_and_pages_recursive(self.sourcetree)
+
+    # now print the tree for source, and show target categories
+    def _to_dict_recursive(self, tree):
+        retval = []
+        for scat,v in tree.iteritems():
+            tcat = self.target_map[scat]
+            
+            pages = [{
+                'source': p,
+                'target': self.wdqmap[self.pagemap[p]][self.targetwiki],
+            } for p in self.pages_in_cat[scat]]
+            
+            subcats = self._to_dict_recursive(v)
+            retval.append({
+                'source': scat,
+                'target': tcat,
+                'subcats': subcats,
+                'pages': pages
+            })
+        return retval
+ 
+    def to_dict(self):
+        return {'source': self.sourcesite,
+                'target': self.targetsite,
+                'wdcat': pywikibot.ItemPage(self.sourcesite.data_repository(), 'Q%i' % self.baseQ),
+                'results': self._to_dict_recursive(self.sourcetree),
+                'queries': self.queries}
+
+    def to_json(self):
+        import json
+        def try_convert_to_url(obj):
+            try:
+                return obj.full_url()
+            except AttributeError:
+                raise TypeError
+        return json.dumps(self.to_dict()['results'], default=try_convert_to_url)
         
         
 if __name__ == "__main__":
